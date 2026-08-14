@@ -1,2 +1,3 @@
 artifacts/
-src/
+/src/
+err.log
