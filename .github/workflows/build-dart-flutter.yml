@@ -1,0 +1,107 @@
+name: build-dart-flutter
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - name: Leer checkout.conf
+        id: config
+        run: |
+          if [ ! -f checkout.conf ]; then
+            echo "::error::Falta checkout.conf"
+            exit 1
+          fi
+          # shellcheck disable=SC1091
+          . ./checkout.conf
+          if [ -z "$REPO_URL" ]; then
+            echo "::error::REPO_URL está vacío. Edita checkout.conf con la URL de tu repositorio fuente."
+            exit 1
+          fi
+          echo "repo_url=$REPO_URL" >> "$GITHUB_OUTPUT"
+          if [ -n "${BRANCH:-}" ]; then
+            echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Obtener repositorio fuente
+        run: |
+          REPO_URL="${{ steps.config.outputs.repo_url }}"
+          if [ "$REPO_URL" = "./" ]; then
+            echo "::error::REPO_URL './' no es válido: usa './nombre_del_directorio'."
+            exit 1
+          fi
+          if [[ "$REPO_URL" == ./* ]]; then
+            if [ ! -d "$REPO_URL" ]; then
+              echo "::error::Directorio local '$REPO_URL' no existe en el commit. Revisa checkout.conf."
+              exit 1
+            fi
+            echo "Usando fuente local: $REPO_URL"
+            cp -r "$REPO_URL" src
+          else
+            BRANCH_FLAGS=()
+            if [ -n "${{ steps.config.outputs.branch }}" ]; then
+              BRANCH_FLAGS=(-b "${{ steps.config.outputs.branch }}")
+            fi
+            git clone --depth 1 "${BRANCH_FLAGS[@]}" "$REPO_URL" src
+          fi
+
+      - name: Instalar Flutter SDK
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Ejecutar build.sh
+        run: |
+          cd src
+          bash ../build.sh
+
+      - name: Subir artefactos del workflow
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: artifacts/**
+          if-no-files-found: warn
+
+      - name: Crear releases definidos en releases.conf
+        run: |
+          if [ ! -f releases.conf ]; then
+            echo "Sin releases.conf; no se crean releases."
+            exit 0
+          fi
+          shopt -s nullglob
+          while IFS='=' read -r name pattern; do
+            case "$name" in \#*|"") continue ;; esac
+            name="$(printf '%s' "$name" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+            pattern="$(printf '%s' "$pattern" | sed -E 's/^[[:space:]]+|[[:space:]]+$//g')"
+            if [ -z "$name" ] || [ -z "$pattern" ]; then
+              continue
+            fi
+            if ! [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]] || [[ "$name" == *..* || "$name" == .* || "$name" == *. ]]; then
+              echo "::warning::Nombre de release '$name' inválido (usa solo A-Za-z0-9._- y sin '..', ni puntos al inicio/fin). Se omite."
+              continue
+            fi
+            mapfile -t files < <(compgen -G "$pattern" || true)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "Sin archivos para release '$name' (patrón: $pattern). Se omite."
+              continue
+            fi
+            tag="${name}-$(date -u +%Y.%m.%d-%H%M%S)"
+            echo "Creando release '$name' (tag: $tag)"
+            gh release create "$tag" "${files[@]}" --title "$name" --generate-notes
+          done < releases.conf
