@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout runner
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Leer checkout.conf
         id: config
@@ -60,16 +60,91 @@ jobs:
             git clone --depth 1 "${BRANCH_FLAGS[@]}" "$REPO_URL" src
           fi
 
+      # ============================================================
+      # INCREMENTAL BUILD: hash de fuente para decidir si reconstruir
+      # ============================================================
+      - name: Calcular hash de fuente
+        id: source-hash
+        run: |
+          # Hash de archivos que afectan el build:
+          # - Dart source, pubspec, Gradle config, Kotlin/Java, Android resources
+          HASH=$(find src/ -type f \
+            \( -name "*.dart" -o -name "pubspec.yaml" -o -name "pubspec.lock" \
+               -o -name "*.gradle" -o -name "*.gradle.kts" -o -name "*.properties" \
+               -o -name "*.kt" -o -name "*.java" -o -name "*.xml" \
+               -o -name "AndroidManifest.xml" -o -name "*.toml" \) \
+            -exec sha256sum {} \; 2>/dev/null | sort | sha256sum | cut -d' ' -f1)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+          echo "Source hash: $HASH"
+
+      - name: Restaurar artefactos de build (cache)
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            src/build/
+            artifacts/
+          key: flutter-build-${{ steps.source-hash.outputs.hash }}
+
+      # --- Cache layer 1: Java (requerido por Gradle) ---
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # --- Cache layer 2: Gradle (dependencies + wrapper + build cache) ---
+      - name: Setup Gradle (cache enhanced)
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          # enhanced cache = gratis para repos públicos, mayor hit rate
+          cache-read-only: false
+
+      # --- Cache layer 3: Flutter SDK + pub dependencies ---
       - name: Instalar Flutter SDK
         uses: subosito/flutter-action@v2
+        id: flutter-action
         with:
           channel: stable
+          flutter-version: "3.47.x"
           cache: true
+          pub-cache: true
 
-      - name: Ejecutar build.sh
+      - name: Info de cache
+        run: |
+          echo "=== Cache status ==="
+          echo "Flutter SDK cache hit: ${{ steps.flutter-action.outputs.CACHE-HIT }}"
+          echo "Pub cache hit: ${{ steps.flutter-action.outputs.PUB-CACHE-HIT }}"
+          echo "Flutter version: ${{ steps.flutter-action.outputs.VERSION }}"
+          echo "Source hash: ${{ steps.source-hash.outputs.hash }}"
+          echo "Build artifacts cache: ${{ steps.build-cache.outputs.cache-hit }}"
+          echo "===================="
+
+      # --- Build condicional: solo si hay cache miss ---
+      - name: Ejecutar build.sh (rebuild)
+        if: steps.build-cache.outputs.cache-hit != 'true'
         run: |
           cd src
           bash ../build.sh
+
+      - name: Build incrementado (skip)
+        if: steps.build-cache.outputs.cache-hit == 'true'
+        run: |
+          echo "✅ Build cache HIT — fuente sin cambios, usando artefactos缓存ados."
+          echo "   Hash: ${{ steps.source-hash.outputs.hash }}"
+          if [ -d "artifacts" ]; then
+            echo "   Artefactos:"
+            ls -lh artifacts/ 2>/dev/null || true
+          fi
+
+      - name: Guardar artefactos de build (cache)
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            src/build/
+            artifacts/
+          key: flutter-build-${{ steps.source-hash.outputs.hash }}
 
       - name: Subir artefactos del workflow
         uses: actions/upload-artifact@v4
